@@ -1,6 +1,7 @@
 # niflheim-local
 
 The Niflheim realm's local flavor: the services a product runs on and its start script, for one machine with no cloud.
+`pack.yaml` provides Postgres 18 (`postgres`) and SeaweedFS 4.45 (`s3`), each pinned by image digest.
 
 Part of [Yggdrasil](https://github.com/ouroboric-dev/yggdrasil), the agentic factory by
 [Ouroboric](https://github.com/ouroboric-dev/ouroboric). Work on it from the Yggdrasil umbrella,
@@ -9,8 +10,8 @@ which holds every component as a submodule and builds them together through `go.
 ## Build and test
 
 ```bash
-go test ./...
-go vet ./...   # both need Go packages, which come with the pack
+GOWORK=off go test -race ./...   # loads pack.yaml and checks the services it provides
+go vet ./...
 ```
 
 ## Docs

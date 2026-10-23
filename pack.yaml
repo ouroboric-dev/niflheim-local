@@ -1,0 +1,20 @@
+# The local flavor of the Niflheim realm (change gallery-runtime): a runtime realm. It holds no leaf, stack or
+# graph. It provides the services a product runs on, one per need of gungnir.Needs, and (T12) the product start
+# script. Postgres 18 keeps its data under /var/lib/postgresql/18/docker, so the pack mounts no data folder.
+name: niflheim-local
+version: 0.1.0
+services:
+  postgres:
+    image: >-
+      docker.io/library/postgres:18.4-bookworm@sha256:882236b897e39051d2368c5ccc6cda944904723506b2dfc97f2a8f5bc9afa382
+    env:
+      POSTGRES_DB: app
+      POSTGRES_HOST_AUTH_METHOD: trust
+    ports: [5432]
+  s3:
+    image: docker.io/chrislusf/seaweedfs:4.45@sha256:fc9f76fa993ad69966ffeb2f65d0318fcae39c6f8e20cf68ef7b3a5cb97769e5
+    command: [server, -s3, -dir=/data]
+    ports: [8333]
+provides:
+  postgres: postgres
+  s3: s3
