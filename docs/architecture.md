@@ -13,11 +13,11 @@ The Niflheim realm's local flavor: the services a product runs on and its start 
 ## Responsibilities
 
 - Is a runtime realm (spec §9.4, as changed by the gallery runtime): it provides the services a product runs on and
-  its start script, and no leaf, stack, template or check ladder.
+  its start script, and no leaf, stack, leaf template or check ladder.
 - Will hold `pack.yaml`, which names the services (Postgres 18 as `postgres` on port 5432, SeaweedFS as `s3` on
   port 8333, both by image digest), says which need each one provides (`provides`) and names the product start
   script (`product.start`).
-- Will hold the product start script, which Odin's `init` writes at a project's root as `start.sh`.
+- Will hold the product start script, `templates/product/start.sh`, which Odin's `init` writes at a project's root as `start.sh`. The product keeps its data under `/app/.data/` (spec §9.3, §9.4).
 - Has no graph. A build realm declares what its leaves need (`needs`); this realm answers with the services.
 - Its templates are copied into products, so they are MIT-licensed (`templates/`).
 
