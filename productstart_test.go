@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -86,8 +87,28 @@ func standIn(name string) {
 			write("weed.identity", fmt.Sprintf("%04o\n%s\n", st.Mode().Perm(), data))
 		}
 		addr = net.JoinHostPort(flagValue("-ip.bind"), flagValue("-s3.port"))
+		// The master answers /dir/status with "Max":0 for a while after a start, as the real one does until the
+		// volume server has registered; the S3 gateway fails requests in that window.
+		start := time.Now()
+		mux := http.NewServeMux()
+		mux.HandleFunc("/dir/status", func(w http.ResponseWriter, _ *http.Request) {
+			max := 0
+			if time.Since(start) > 2*time.Second {
+				max = 8
+				write("weed.maxup", strconv.FormatInt(time.Now().UnixNano(), 10)+"\n")
+			}
+			fmt.Fprintf(w, `{"Topology":{"Max":%d},"Version":"stand-in"}`, max)
+		})
+		ml, err := net.Listen("tcp", net.JoinHostPort(flagValue("-ip.bind"), flagValue("-master.port")))
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "stand-in:", err)
+			os.Exit(1)
+		}
+		defer ml.Close()
+		go func() { _ = http.Serve(ml, mux) }()
 	case "api", "web":
 		write(name+".env", strings.Join(os.Environ(), "\n")+"\n")
+		write(name+".time", strconv.FormatInt(time.Now().UnixNano(), 10)+"\n")
 		addr = net.JoinHostPort(os.Getenv("HOST"), os.Getenv("PORT"))
 	}
 	if os.Getenv("YGG_DEAD_PART") == name {
@@ -157,6 +178,8 @@ func newApp(t *testing.T, release bool) *app {
 	for _, tool := range []string{"initdb", "postgres", "createdb", "weed"} {
 		writeExec(t, filepath.Join(a.bin, tool), fmt.Sprintf("#!/bin/bash\nexec env YGG_STANDIN=%s %q \"$@\"\n", tool, self))
 	}
+	// The script refuses root and CI runs the tests as root, so the tests give it a user id of their own.
+	writeExec(t, filepath.Join(a.bin, "id"), "#!/bin/bash\necho 1000\n")
 	for _, leaf := range []string{"api", "web"} {
 		path := filepath.Join(a.dir, "repos", leaf, "run.sh")
 		which := "leaf"
@@ -196,6 +219,7 @@ func (a *app) start(extraEnv ...string) *run {
 		"YGG_API_PORT="+strconv.Itoa(a.ports["api"]),
 		"YGG_WEB_PORT="+strconv.Itoa(a.ports["web"]),
 		"YGG_START_WAIT=20",
+		"YGG_MASTER_PORT="+strconv.Itoa(freePort(a.t)),
 	)
 	cmd.Env = append(cmd.Env, extraEnv...)
 	r := &run{cmd: cmd, out: &bytes.Buffer{}, done: make(chan error, 1)}
@@ -425,6 +449,14 @@ func TestProductStart(t *testing.T) {
 		if !strings.Contains(body, api["S3_SECRET_ACCESS_KEY"]) || !strings.Contains(body, api["S3_ACCESS_KEY_ID"]) {
 			t.Errorf("identity file %q lacks the key pair given to the API", body)
 		}
+		for _, f := range []string{"-logdir", "-volume.preStopSeconds"} {
+			if flag(weed, f) == "" {
+				t.Errorf("weed has no %s", f)
+			}
+		}
+		if flag(weed, "-logdir") == data || strings.HasPrefix(flag(weed, "-logdir"), data+"/") {
+			t.Errorf("weed log folder %q is under .data; want the script's temporary folder", flag(weed, "-logdir"))
+		}
 		a.stop(r)
 		if bytes.Contains(r.out.Bytes(), []byte(api["S3_SECRET_ACCESS_KEY"])) || bytes.Contains(r.out.Bytes(), []byte(api["S3_ACCESS_KEY_ID"])) {
 			t.Errorf("the script printed the key pair:\n%s", r.out)
@@ -518,6 +550,22 @@ func TestProductStart(t *testing.T) {
 			if got := strings.TrimSpace(string(data)); got != want {
 				t.Errorf("%s got signal %q; want %q", name, got, want)
 			}
+		}
+	})
+
+	t.Run("the API starts after the master has volumes", func(t *testing.T) {
+		a := newApp(t, true)
+		r := a.start()
+		a.waitReady(r)
+		a.stop(r)
+		read := func(f string) int64 {
+			data, _ := os.ReadFile(filepath.Join(a.rec, f))
+			n, _ := strconv.ParseInt(strings.TrimSpace(string(data)), 10, 64)
+			return n
+		}
+		up, api := read("weed.maxup"), read("api.time")
+		if up == 0 || api < up {
+			t.Errorf("the API started at %d, before the master had volumes (%d)", api, up)
 		}
 	})
 

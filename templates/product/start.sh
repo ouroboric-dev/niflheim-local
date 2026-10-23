@@ -4,7 +4,7 @@
 # project root as start.sh. The product keeps all its data under .data/ in this folder, so a restart finds it.
 # Each leaf starts from .ygg/release/repos/<leaf>/run.sh, or from repos/<leaf>/run.sh when there is no release.
 # Postgres (initdb, postgres, createdb) and weed come from the task image's PATH. Needs bash 5.1 or later.
-# YGG_PG_PORT, YGG_S3_PORT, YGG_API_PORT, YGG_WEB_PORT and YGG_START_WAIT (seconds all the waits for ports share,
+# YGG_PG_PORT, YGG_S3_PORT, YGG_MASTER_PORT, YGG_API_PORT, YGG_WEB_PORT and YGG_START_WAIT (seconds all the waits for ports share,
 # default 100) are for the script's tests only. The grader sets none of them.
 set -euo pipefail
 
@@ -16,7 +16,7 @@ cd "$(dirname "${BASH_SOURCE[0]}")"
 root="$PWD"
 
 pg_port="${YGG_PG_PORT:-5432}" s3_port="${YGG_S3_PORT:-8333}"
-api_port="${YGG_API_PORT:-8080}" web_port="${YGG_WEB_PORT:-3000}"
+master_port="${YGG_MASTER_PORT:-9333}" api_port="${YGG_API_PORT:-8080}" web_port="${YGG_WEB_PORT:-3000}"
 bucket="ygg-store" region="us-east-1" lo="127.0.0.1"
 
 # leaf_run NAME prints the script that starts the leaf NAME.
@@ -52,9 +52,12 @@ cleanup() {
       if [ "${names[i]}" = postgres ]; then kill -INT "${pids[i]}" 2>/dev/null || true
       else kill -TERM -- "-${pids[i]}" 2>/dev/null || true; fi
     done
-    # A part that has not ended in 10 seconds is killed. The watchdog holds no output open.
+    # A part that has not ended in 10 seconds is killed, except weed, which has 15: it closes its gRPC servers
+    # gracefully and its volume server waits -volume.preStopSeconds first. The watchdog holds no output open.
     (
       sleep 10
+      for i in "${!pids[@]}"; do [ "${names[i]}" = weed ] || kill -KILL -- "-${pids[i]}" 2>/dev/null || true; done
+      sleep 5
       for p in "${pids[@]}"; do kill -KILL -- "-$p" 2>/dev/null || true; done
     ) >/dev/null 2>&1 &
     local watchdog=$!
@@ -151,9 +154,37 @@ identity="$data/seaweed-identity.json"
 JSON
 )
 chmod 600 "$identity"
-launch weed weed server -s3 -ip="$lo" -ip.bind="$lo" -dir="$data/seaweed" -s3.config="$identity" \
-  -s3.port="$s3_port" -master.port=9333 -volume.port=8081 -filer.port=8888 -master.volumeSizeLimitMB=256
+# -logdir is a flag of weed itself, so it comes before the command: weed otherwise logs into /tmp. No Iceberg
+# catalog is needed (-s3.port.iceberg=0; it would listen on 8181). -volume.preStopSeconds=1 (default 10) makes the
+# volume server stop at once.
+launch weed weed -logdir="$log" server -s3 -ip="$lo" -ip.bind="$lo" -dir="$data/seaweed" -s3.config="$identity" \
+  -s3.port="$s3_port" -s3.port.iceberg=0 -master.port="$master_port" -volume.port=8081 -filer.port=8888 \
+  -master.volumeSizeLimitMB=256 -volume.preStopSeconds=1
 wait_for weed "$s3_port"
+# After a restart the S3 port opens before the volume server has registered, and S3 answers 500 ("volume id N not
+# found") for a few seconds. The master's status shows "Max" above 0 once volumes can be placed; wait for that.
+master_has_volumes() {
+  local body
+  body="$(
+    exec 3<>"/dev/tcp/$lo/$master_port" || exit 1
+    printf 'GET /dir/status HTTP/1.0\r\nHost: %s\r\n\r\n' "$lo" >&3
+    cat <&3
+  )" 2>/dev/null || return 1
+  grep -oE '"Max": *[0-9]+' <<<"$body" | grep -qvE '"Max": *0$'
+}
+until master_has_volumes; do
+  if [ "$SECONDS" -ge "$deadline" ]; then
+    echo "start: weed did not get a volume server in time"
+    show_log weed
+    exit 1
+  fi
+  if ! kill -0 "${pids[${#pids[@]} - 1]}" 2>/dev/null; then
+    echo "start: weed stopped before it was ready"
+    show_log weed
+    exit 1
+  fi
+  sleep 0.2
+done
 s3_endpoint="http://$lo:$s3_port"
 
 echo "== api"
