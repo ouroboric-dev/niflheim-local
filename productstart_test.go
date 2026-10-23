@@ -138,16 +138,24 @@ type app struct {
 	bin   string
 	rec   string
 	ports map[string]int
+	// extraEnv is the environment start was given; retried says a start met a taken port and was run again.
+	extraEnv []string
+	retried  bool
 }
 
-func freePort(t *testing.T) int {
+// freePorts picks n distinct free ports. It holds every listener open until all are chosen, so no two are the same.
+func freePorts(t *testing.T, n int) []int {
 	t.Helper()
-	l, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
+	var ports []int
+	for range n {
+		l, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer l.Close()
+		ports = append(ports, l.Addr().(*net.TCPAddr).Port)
 	}
-	defer l.Close()
-	return l.Addr().(*net.TCPAddr).Port
+	return ports
 }
 
 func writeExec(t *testing.T, path, text string) {
@@ -207,8 +215,27 @@ type run struct {
 
 func (a *app) start(extraEnv ...string) *run {
 	a.t.Helper()
-	for _, n := range []string{"pg", "s3", "api", "web"} {
-		a.ports[n] = freePort(a.t)
+	a.extraEnv = extraEnv
+	r := &run{}
+	a.launch(r)
+	a.t.Cleanup(func() {
+		_ = r.cmd.Process.Signal(syscall.SIGKILL)
+		for _, name := range []string{"postgres", "weed", "api", "web"} {
+			for _, pid := range a.pids(name) {
+				_ = syscall.Kill(pid, syscall.SIGKILL)
+			}
+		}
+	})
+	return r
+}
+
+// launch picks the ports and runs the script into r. The ports are free when chosen and held open until the script
+// is about to start.
+func (a *app) launch(r *run) {
+	a.t.Helper()
+	p := freePorts(a.t, 5)
+	for i, n := range []string{"pg", "s3", "api", "web", "master"} {
+		a.ports[n] = p[i]
 	}
 	cmd := exec.Command("bash", filepath.Join(a.dir, "start.sh"))
 	cmd.Env = append(os.Environ(),
@@ -218,25 +245,16 @@ func (a *app) start(extraEnv ...string) *run {
 		"YGG_S3_PORT="+strconv.Itoa(a.ports["s3"]),
 		"YGG_API_PORT="+strconv.Itoa(a.ports["api"]),
 		"YGG_WEB_PORT="+strconv.Itoa(a.ports["web"]),
+		"YGG_MASTER_PORT="+strconv.Itoa(a.ports["master"]),
 		"YGG_START_WAIT=20",
-		"YGG_MASTER_PORT="+strconv.Itoa(freePort(a.t)),
 	)
-	cmd.Env = append(cmd.Env, extraEnv...)
-	r := &run{cmd: cmd, out: &bytes.Buffer{}, done: make(chan error, 1)}
+	cmd.Env = append(cmd.Env, a.extraEnv...)
+	*r = run{cmd: cmd, out: &bytes.Buffer{}, done: make(chan error, 1)}
 	cmd.Stdout, cmd.Stderr = r.out, r.out
 	if err := cmd.Start(); err != nil {
 		a.t.Fatal(err)
 	}
 	go func() { r.done <- cmd.Wait() }()
-	a.t.Cleanup(func() {
-		_ = cmd.Process.Signal(syscall.SIGKILL)
-		for _, name := range []string{"postgres", "weed", "api", "web"} {
-			for _, pid := range a.pids(name) {
-				_ = syscall.Kill(pid, syscall.SIGKILL)
-			}
-		}
-	})
-	return r
 }
 
 func (a *app) pids(name string) []int {
@@ -267,6 +285,13 @@ func (a *app) waitReady(r *run) {
 	for time.Now().Before(deadline) {
 		select {
 		case err := <-r.done:
+			// Another process may take a port between its choice and its use; that is run again once.
+			if !a.retried && strings.Contains(r.out.String(), "address already in use") {
+				a.retried = true
+				a.t.Logf("a port was taken; starting again")
+				a.launch(r)
+				continue
+			}
 			a.t.Fatalf("the script ended before it was ready: %v\n%s", err, r.out)
 		default:
 		}
