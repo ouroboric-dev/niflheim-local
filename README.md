@@ -10,7 +10,7 @@ which holds every component as a submodule and builds them together through `go.
 
 ```bash
 go test ./...
-go vet ./...   # both need Go packages, which come with the pack (T11)
+go vet ./...   # both need Go packages, which come with the pack
 ```
 
 ## Docs
