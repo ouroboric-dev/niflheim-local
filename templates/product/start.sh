@@ -4,7 +4,8 @@
 # project root as start.sh. The product keeps all its data under .data/ in this folder, so a restart finds it.
 # Each leaf starts from .ygg/release/repos/<leaf>/run.sh, or from repos/<leaf>/run.sh when there is no release.
 # Postgres (initdb, postgres, createdb) and weed come from the task image's PATH. Needs bash 5.1 or later.
-# YGG_START_WAIT (default 100) is the number of seconds all the waits for ports share.
+# YGG_PG_PORT, YGG_S3_PORT, YGG_API_PORT, YGG_WEB_PORT and YGG_START_WAIT (seconds all the waits for ports share,
+# default 100) are for the script's tests only. The grader sets none of them.
 set -euo pipefail
 
 if [ "$(id -u)" -eq 0 ]; then
@@ -44,19 +45,22 @@ names=() pids=() secret=""
 cleanup() {
   trap '' TERM INT
   local i p
-  for ((i = ${#pids[@]} - 1; i >= 0; i--)); do
-    # Postgres shuts down fast on INT; the other parts stop on TERM. Each part has a process group of its own.
-    if [ "${names[i]}" = postgres ]; then kill -INT -- "-${pids[i]}" 2>/dev/null || true
-    else kill -TERM -- "-${pids[i]}" 2>/dev/null || true; fi
-  done
-  # A part that has not ended in 10 seconds is killed. The watchdog holds no output open.
-  (
-    sleep 10
-    for p in "${pids[@]}"; do kill -KILL -- "-$p" 2>/dev/null || true; done
-  ) >/dev/null 2>&1 &
-  local watchdog=$!
-  wait "${pids[@]}" 2>/dev/null || true
-  kill "$watchdog" 2>/dev/null || true
+  if [ "${#pids[@]}" -gt 0 ]; then
+    for ((i = ${#pids[@]} - 1; i >= 0; i--)); do
+      # Postgres shuts down fast on INT, sent to the postmaster alone; the other parts stop on TERM, sent to their
+      # process group (each part has one of its own).
+      if [ "${names[i]}" = postgres ]; then kill -INT "${pids[i]}" 2>/dev/null || true
+      else kill -TERM -- "-${pids[i]}" 2>/dev/null || true; fi
+    done
+    # A part that has not ended in 10 seconds is killed. The watchdog holds no output open.
+    (
+      sleep 10
+      for p in "${pids[@]}"; do kill -KILL -- "-$p" 2>/dev/null || true; done
+    ) >/dev/null 2>&1 &
+    local watchdog=$!
+    wait "${pids[@]}" 2>/dev/null || true
+    kill "$watchdog" 2>/dev/null || true
+  fi
   rm -rf -- "$log"
 }
 trap cleanup EXIT
@@ -98,12 +102,23 @@ wait_for() {
 
 echo "== postgres"
 pgdata="$data/postgres"
-if [ ! -f "$pgdata/PG_VERSION" ]; then
+# The marker says initdb finished. A folder without it is what a crash left, and initdb needs an empty one.
+if [ ! -f "$data/.initdb-done" ]; then
+  rm -rf -- "$pgdata" "$data/.database-created"
   initdb -D "$pgdata" -U postgres --auth=trust -E UTF8 --locale=C.UTF-8 >"$log/initdb.log" 2>&1 || {
     echo "start: initdb failed"
     show_log initdb
     exit 1
   }
+  touch "$data/.initdb-done"
+fi
+# A postmaster.pid from a crashed start stops Postgres when its pid is in use again (a new container reuses pids).
+# It stays only while a postgres of this data folder runs under that pid.
+if [ -f "$pgdata/postmaster.pid" ]; then
+  old_pid="$(head -n 1 "$pgdata/postmaster.pid" 2>/dev/null || true)"
+  if [[ ! "$old_pid" =~ ^[0-9]+$ ]] || ! tr '\0' ' ' <"/proc/$old_pid/cmdline" 2>/dev/null | grep -qF -- "$pgdata"; then
+    rm -f -- "$pgdata/postmaster.pid"
+  fi
 fi
 pgsock="$log/pgsock"
 mkdir -p "$pgsock"
@@ -111,7 +126,9 @@ launch postgres postgres -D "$pgdata" -h "$lo" -p "$pg_port" -k "$pgsock"
 wait_for postgres "$pg_port"
 if [ ! -f "$data/.database-created" ]; then
   # The port opens before Postgres accepts connections, so createdb tries again until it does.
-  until createdb -h "$lo" -p "$pg_port" -U postgres app >"$log/createdb.log" 2>&1; do
+  # A database that exists already (a crash after createdb, before the marker) counts as made.
+  until createdb -h "$lo" -p "$pg_port" -U postgres app >"$log/createdb.log" 2>&1 ||
+    grep -q 'already exists' "$log/createdb.log"; do
     if [ "$SECONDS" -ge "$deadline" ]; then
       echo "start: createdb could not make the database app"
       show_log createdb
@@ -140,10 +157,11 @@ wait_for weed "$s3_port"
 s3_endpoint="http://$lo:$s3_port"
 
 echo "== api"
-launch api env -C "$(dirname "$api_run")" HOST="$lo" PORT="$api_port" \
+# The key pair goes in through the environment of this one call, not through env's arguments (ps shows those).
+S3_ACCESS_KEY_ID="$access_key" S3_SECRET_ACCESS_KEY="$secret" \
+  launch api env -C "$(dirname "$api_run")" HOST="$lo" PORT="$api_port" \
   DATABASE_URL="postgres://postgres@$lo:$pg_port/app?sslmode=disable" DATA_DIR="$data/api" \
-  S3_ENDPOINT="$s3_endpoint" S3_REGION="$region" S3_BUCKET="$bucket" \
-  S3_ACCESS_KEY_ID="$access_key" S3_SECRET_ACCESS_KEY="$secret" "$root/$api_run"
+  S3_ENDPOINT="$s3_endpoint" S3_REGION="$region" S3_BUCKET="$bucket" "$root/$api_run"
 wait_for api "$api_port"
 
 echo "== web"

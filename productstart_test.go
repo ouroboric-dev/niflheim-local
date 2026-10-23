@@ -54,12 +54,30 @@ func standIn(name string) {
 	var addr string
 	switch name {
 	case "initdb":
+		if os.Getenv("YGG_INITDB_FAIL") != "" {
+			fmt.Fprintln(os.Stderr, "initdb: stand-in told to fail")
+			os.Exit(1)
+		}
+		// Like the real one, it refuses a folder that holds something.
+		if entries, _ := os.ReadDir(flagValue("-D")); len(entries) > 0 {
+			fmt.Fprintln(os.Stderr, "initdb: error: directory exists but is not empty")
+			os.Exit(1)
+		}
 		_ = os.MkdirAll(flagValue("-D"), 0o755)
 		_ = os.WriteFile(filepath.Join(flagValue("-D"), "PG_VERSION"), []byte("18\n"), 0o644)
 		return
 	case "createdb":
+		if os.Getenv("YGG_DB_EXISTS") != "" {
+			fmt.Fprintln(os.Stderr, `createdb: error: database creation failed: ERROR:  database "app" already exists`)
+			os.Exit(1)
+		}
 		return
 	case "postgres":
+		state := "absent"
+		if _, err := os.Stat(filepath.Join(flagValue("-D"), "postmaster.pid")); err == nil {
+			state = "present"
+		}
+		write("postgres.pidfile", state+"\n")
 		addr = net.JoinHostPort(flagValue("-h"), flagValue("-p"))
 	case "weed":
 		id := flagValue("-s3.config")
@@ -86,7 +104,9 @@ func standIn(name string) {
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
 	select {
-	case <-sig:
+	case got := <-sig:
+		names := map[os.Signal]string{os.Interrupt: "INT", syscall.SIGTERM: "TERM"}
+		write(name+".sig", names[got]+"\n")
 	case <-time.After(time.Minute):
 	}
 }
@@ -316,7 +336,7 @@ func flag(args []string, name string) string {
 
 func (a *app) clearRecords(names ...string) {
 	for _, n := range names {
-		for _, ext := range []string{".args", ".env", ".pid", ".identity"} {
+		for _, ext := range []string{".args", ".env", ".pid", ".identity", ".pidfile", ".sig"} {
 			_ = os.Remove(filepath.Join(a.rec, n+ext))
 		}
 	}
@@ -392,6 +412,11 @@ func TestProductStart(t *testing.T) {
 			}
 		}
 
+		for k := range web {
+			if strings.HasPrefix(k, "S3_ACCESS") || strings.HasPrefix(k, "S3_SECRET") {
+				t.Errorf("the web part has %s in its environment; only the API gets the key pair", k)
+			}
+		}
 		ident, _ := os.ReadFile(filepath.Join(a.rec, "weed.identity"))
 		mode, body, _ := strings.Cut(string(ident), "\n")
 		if mode != "0600" {
@@ -477,12 +502,87 @@ func TestProductStart(t *testing.T) {
 		a.allStopped("postgres", "weed", "api", "web")
 	})
 
-	t.Run("TERM stops every part", func(t *testing.T) {
+	t.Run("TERM stops every part with the signal each one takes", func(t *testing.T) {
+		a := newApp(t, true)
+		r := a.start()
+		a.waitReady(r)
+		began := time.Now()
+		a.stop(r)
+		// The script's own 10 second KILL must not be what stops the parts.
+		if d := time.Since(began); d > 5*time.Second {
+			t.Errorf("the script took %v to stop; want under 5s", d)
+		}
+		a.allStopped("postgres", "weed", "api", "web")
+		for name, want := range map[string]string{"postgres": "INT", "weed": "TERM", "api": "TERM", "web": "TERM"} {
+			data, _ := os.ReadFile(filepath.Join(a.rec, name+".sig"))
+			if got := strings.TrimSpace(string(data)); got != want {
+				t.Errorf("%s got signal %q; want %q", name, got, want)
+			}
+		}
+	})
+
+	t.Run("createdb finding the database already made is not a failure", func(t *testing.T) {
+		a := newApp(t, true)
+		r := a.start("YGG_DB_EXISTS=1")
+		a.waitReady(r)
+		a.stop(r)
+	})
+
+	t.Run("a folder without the initdb marker is made again from nothing", func(t *testing.T) {
+		a := newApp(t, true)
+		pg := filepath.Join(a.dir, ".data", "postgres")
+		if err := os.MkdirAll(pg, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		// What a crash in the middle of initdb leaves.
+		if err := os.WriteFile(filepath.Join(pg, "PG_VERSION"), []byte("18\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		r := a.start()
+		a.waitReady(r)
+		a.stop(r)
+		if n := a.calls("initdb"); n != 1 {
+			t.Errorf("initdb ran %d times; want 1", n)
+		}
+		if _, err := os.Stat(filepath.Join(a.dir, ".data", ".initdb-done")); err != nil {
+			t.Errorf("no initdb marker after a good start: %v", err)
+		}
+	})
+
+	t.Run("a stale postmaster.pid is removed", func(t *testing.T) {
 		a := newApp(t, true)
 		r := a.start()
 		a.waitReady(r)
 		a.stop(r)
 		a.allStopped("postgres", "weed", "api", "web")
+		a.clearRecords("postgres", "weed", "api", "web")
+		// A crashed start left the file, and its pid now belongs to some other process (this test).
+		pidfile := filepath.Join(a.dir, ".data", "postgres", "postmaster.pid")
+		if err := os.WriteFile(pidfile, []byte(strconv.Itoa(os.Getpid())+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		r = a.start()
+		a.waitReady(r)
+		a.stop(r)
+		data, _ := os.ReadFile(filepath.Join(a.rec, "postgres.pidfile"))
+		if got := strings.TrimSpace(string(data)); got != "absent" {
+			t.Errorf("postgres found postmaster.pid %q; want it removed", got)
+		}
+	})
+
+	t.Run("a failed initdb ends the script at once", func(t *testing.T) {
+		a := newApp(t, true)
+		began := time.Now()
+		r := a.start("YGG_INITDB_FAIL=1")
+		if err := a.wait(r); err == nil {
+			t.Error("the script exited 0; want non-zero")
+		}
+		if d := time.Since(began); d > 5*time.Second {
+			t.Errorf("the script took %v to end; want under 5s", d)
+		}
+		if !strings.Contains(r.out.String(), "initdb") {
+			t.Errorf("output %q does not name initdb", r.out)
+		}
 	})
 
 	t.Run("it refuses to run as root", func(t *testing.T) {
