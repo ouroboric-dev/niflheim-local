@@ -1,8 +1,9 @@
 # The local flavor of the Niflheim realm (change gallery-runtime): a runtime realm. It holds no leaf, stack or
-# graph. It provides the services a product runs on, one per need of gungnir.Needs, and (T12) the product start
+# graph. It provides the services a product runs on, one per need of gungnir.Needs, and the product start
 # script. Postgres 18 keeps its data under /var/lib/postgresql/18/docker, so the pack mounts no data folder.
 name: niflheim-local
 version: 0.1.0
+product: {start: templates/product/start.sh}
 services:
   postgres:
     image: >-

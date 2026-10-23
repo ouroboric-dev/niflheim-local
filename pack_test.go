@@ -1,6 +1,8 @@
 package niflheim
 
 import (
+	"os"
+	"path/filepath"
 	"regexp"
 	"slices"
 	"testing"
@@ -72,5 +74,19 @@ func TestPackPostgresIsEighteen(t *testing.T) {
 func TestPackSeaweedFSIsTheGraderImages(t *testing.T) {
 	if svc := service(t, loadPack(t), "s3"); svc.Image != seaweedFSImage {
 		t.Errorf("s3 image %q; want the grader image's %q", svc.Image, seaweedFSImage)
+	}
+}
+
+func TestPackNamesTheProductStart(t *testing.T) {
+	p := loadPack(t)
+	if p.Product == nil || p.Product.Start != "templates/product/start.sh" {
+		t.Fatalf("pack product = %+v; want start templates/product/start.sh", p.Product)
+	}
+	st, err := os.Stat(filepath.Join(".", p.Product.Start))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !st.Mode().IsRegular() || st.Mode().Perm()&0o111 == 0 {
+		t.Errorf("%s mode %v; want an executable regular file", p.Product.Start, st.Mode())
 	}
 }
